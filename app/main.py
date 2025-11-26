@@ -10,7 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import get_settings
 from .dependencies import lifespan_context
-from .routers import notes
+from .routers import notes, tags
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +47,7 @@ app.add_middleware(
 app.add_middleware(LoggingMiddleware)
 
 app.include_router(notes.router)
+app.include_router(tags.router)
 
 
 @app.get("/health", tags=["health"])
