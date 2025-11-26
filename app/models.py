@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -32,6 +42,7 @@ class Note(Base):
     title = Column(String(255), nullable=False)
     slug = Column(String(255), unique=True, nullable=False)
     parent_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="SET NULL"), nullable=True)
+    order_index = Column(Integer, nullable=False, server_default=text("0"))
     metadata = Column(JSONB, server_default=text("'{}'::jsonb"), nullable=False)
     type = Column(String(50), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
