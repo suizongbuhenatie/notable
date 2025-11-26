@@ -22,6 +22,7 @@ class NoteBase(BaseModel):
     type: str
     parent_id: UUID | None = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    user_id: UUID | None = None
 
 
 class NoteCreate(NoteBase):
@@ -35,6 +36,7 @@ class NoteUpdate(BaseModel):
     parent_id: Optional[UUID | None] = None
     metadata: Optional[Dict[str, Any]] = None
     tags: Optional[List[str]] = None
+    user_id: Optional[UUID | None] = None
 
 
 class MoveRequest(BaseModel):
@@ -44,6 +46,7 @@ class MoveRequest(BaseModel):
 
 class NoteRead(BaseModel):
     id: UUID
+    user_id: UUID | None
     title: str
     slug: str
     parent_id: UUID | None
@@ -76,6 +79,7 @@ class NotesListResponse(BaseModel):
 def _serialize_note(note: Note) -> dict[str, Any]:
     return {
         "id": note.id,
+        "user_id": note.user_id,
         "title": note.title,
         "slug": note.slug,
         "parent_id": note.parent_id,
@@ -94,13 +98,19 @@ def _apply_filters(
     title: str | None,
     tag: str | None,
     note_type: str | None,
+    user_id: UUID | None,
 ):
+    if user_id:
+        stmt = stmt.where(Note.user_id == user_id)
     if title:
         stmt = stmt.where(Note.title.ilike(f"%{title}%"))
     if note_type:
         stmt = stmt.where(Note.type == note_type)
     if tag:
-        stmt = stmt.join(Note.note_tags).join(NoteTag.tag).where(Tag.slug == tag)
+        stmt = stmt.join(Note.note_tags).join(NoteTag.tag)
+        if user_id:
+            stmt = stmt.where(Tag.user_id == user_id)
+        stmt = stmt.where(Tag.slug == tag)
     return stmt
 
 
@@ -119,6 +129,13 @@ def _fetch_note(db: Session, note_id: UUID) -> Note:
     return note
 
 
+def _fetch_tag(db: Session, tag_id: UUID) -> Tag:
+    tag = db.execute(select(Tag).where(Tag.id == tag_id)).scalar_one_or_none()
+    if not tag:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag not found")
+    return tag
+
+
 def _set_note_tags(db: Session, note: Note, tag_slugs: list[str]) -> None:
     normalized = {slug.strip() for slug in tag_slugs if slug.strip()}
     current = {note_tag.tag.slug: note_tag for note_tag in note.note_tags}
@@ -127,9 +144,11 @@ def _set_note_tags(db: Session, note: Note, tag_slugs: list[str]) -> None:
         note.note_tags.remove(current[slug])
 
     for slug in normalized - set(current):
-        tag = db.execute(select(Tag).where(Tag.slug == slug)).scalar_one_or_none()
+        tag = db.execute(
+            select(Tag).where(Tag.slug == slug, Tag.user_id == note.user_id)
+        ).scalar_one_or_none()
         if not tag:
-            tag = Tag(name=slug, slug=slug)
+            tag = Tag(name=slug, slug=slug, user_id=note.user_id)
             db.add(tag)
             db.flush([tag])
         note.note_tags.append(NoteTag(tag=tag))
@@ -174,6 +193,14 @@ def _reorder_siblings(
         sibling.order_index = index
 
 
+def _assert_same_scope(note: Note, tag: Tag) -> None:
+    if tag.user_id and note.user_id != tag.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tag belongs to a different user",
+        )
+
+
 @router.get("", response_model=NotesListResponse)
 def list_notes(
     *,
@@ -183,15 +210,19 @@ def list_notes(
     title: str | None = None,
     tag: str | None = None,
     note_type: str | None = Query(default=None, alias="type"),
+    user_id: UUID | None = None,
 ):
     base_stmt = select(Note)
-    filtered_stmt = _apply_filters(base_stmt, title=title, tag=tag, note_type=note_type)
+    filtered_stmt = _apply_filters(
+        base_stmt, title=title, tag=tag, note_type=note_type, user_id=user_id
+    )
 
     total_query = _apply_filters(
         select(func.count(func.distinct(Note.id))).select_from(Note),
         title=title,
         tag=tag,
         note_type=note_type,
+        user_id=user_id,
     )
     total = db.execute(total_query).scalar_one()
 
@@ -219,8 +250,11 @@ def get_notes_tree(
     title: str | None = None,
     tag: str | None = None,
     note_type: str | None = Query(default=None, alias="type"),
+    user_id: UUID | None = None,
 ):
-    stmt = _apply_filters(select(Note), title=title, tag=tag, note_type=note_type)
+    stmt = _apply_filters(
+        select(Note), title=title, tag=tag, note_type=note_type, user_id=user_id
+    )
     if tag:
         stmt = stmt.distinct(Note.id)
 
@@ -256,6 +290,7 @@ def create_note(*, db: Session = Depends(get_db), payload: NoteCreate):
         select(func.coalesce(func.max(Note.order_index), -1)).where(Note.parent_id == payload.parent_id)
     ).scalar_one()
     note = Note(
+        user_id=payload.user_id,
         title=payload.title,
         slug=payload.slug,
         type=payload.type,
@@ -298,6 +333,13 @@ def update_note(note_id: UUID, *, db: Session = Depends(get_db), payload: NoteUp
         note.type = payload.type
     if payload.metadata is not None:
         note.metadata = payload.metadata
+    if payload.user_id is not None and payload.user_id != note.user_id:
+        note.user_id = payload.user_id
+        note.note_tags = [
+            nt
+            for nt in note.note_tags
+            if nt.tag.user_id is None or nt.tag.user_id == note.user_id
+        ]
 
     if payload.tags is not None:
         _set_note_tags(db, note, payload.tags)
@@ -313,6 +355,33 @@ def delete_note(note_id: UUID, db: Session = Depends(get_db)) -> None:
     db.delete(note)
     db.commit()
     return None
+
+
+@router.post("/{note_id}/tags/{tag_id}", response_model=NoteRead)
+def attach_tag(note_id: UUID, tag_id: UUID, db: Session = Depends(get_db)):
+    note = _fetch_note(db, note_id)
+    tag = _fetch_tag(db, tag_id)
+    _assert_same_scope(note, tag)
+
+    existing = next((nt for nt in note.note_tags if nt.tag_id == tag.id), None)
+    if not existing:
+        note.note_tags.append(NoteTag(tag=tag))
+        db.commit()
+        db.refresh(note)
+
+    return NoteRead.model_validate(_serialize_note(note))
+
+
+@router.delete("/{note_id}/tags/{tag_id}", status_code=status.HTTP_200_OK, response_model=NoteRead)
+def detach_tag(note_id: UUID, tag_id: UUID, db: Session = Depends(get_db)):
+    note = _fetch_note(db, note_id)
+    tag = _fetch_tag(db, tag_id)
+    _assert_same_scope(note, tag)
+
+    note.note_tags = [nt for nt in note.note_tags if nt.tag_id != tag.id]
+    db.commit()
+    db.refresh(note)
+    return NoteRead.model_validate(_serialize_note(note))
 
 
 @router.post("/{note_id}/move", response_model=NoteRead)

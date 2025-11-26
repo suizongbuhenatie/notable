@@ -32,6 +32,7 @@ class User(Base):
 
     notes = relationship("Note", back_populates="user", cascade="all, delete-orphan")
     settings = relationship("Setting", back_populates="user", cascade="all, delete-orphan")
+    tags = relationship("Tag", back_populates="user", cascade="all, delete-orphan")
 
 
 class Note(Base):
@@ -75,15 +76,21 @@ class NoteContent(Base):
 
 class Tag(Base):
     __tablename__ = "tags"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_user_tag_name"),
+        UniqueConstraint("user_id", "slug", name="uq_user_tag_slug"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     name = Column(String(100), nullable=False)
-    slug = Column(String(150), unique=True, nullable=False)
+    slug = Column(String(150), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
+    user = relationship("User", back_populates="tags")
     note_tags = relationship("NoteTag", back_populates="tag", cascade="all, delete-orphan")
 
 
