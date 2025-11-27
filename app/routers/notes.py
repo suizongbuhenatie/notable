@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.dependencies import get_db
-from app.models import Note, NoteTag, Tag
+from app.models import Note, NoteContent, NoteTag, Tag
 
 
 router = APIRouter(prefix="/notes", tags=["notes"])
@@ -76,6 +76,22 @@ class NotesListResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class NoteContentCreate(BaseModel):
+    tiptap_json: Dict[str, Any]
+    markdown: Optional[str] = None
+
+
+class NoteContentRead(BaseModel):
+    version: int
+    tiptap_json: Dict[str, Any] | None
+    markdown: str | None
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
 def _serialize_note(note: Note) -> dict[str, Any]:
     return {
         "id": note.id,
@@ -112,6 +128,73 @@ def _apply_filters(
             stmt = stmt.where(Tag.user_id == user_id)
         stmt = stmt.where(Tag.slug == tag)
     return stmt
+
+
+def _convert_tiptap_to_markdown(content: dict[str, Any]) -> str:
+    def render_inline(node: dict[str, Any]) -> str:
+        text = node.get("text", "")
+        for mark in node.get("marks", []) or []:
+            mark_type = mark.get("type")
+            if mark_type == "bold":
+                text = f"**{text}**"
+            elif mark_type == "italic":
+                text = f"*{text}*"
+            elif mark_type == "strike":
+                text = f"~~{text}~~"
+            elif mark_type == "code":
+                text = f"`{text}`"
+            elif mark_type == "link":
+                href = mark.get("attrs", {}).get("href", "")
+                text = f"[{text}]({href})" if href else text
+        return text
+
+    def render_node(node: dict[str, Any]) -> str:
+        node_type = node.get("type")
+        children = node.get("content", []) or []
+
+        if node_type == "doc":
+            return "\n\n".join(filter(None, (render_node(child) for child in children)))
+        if node_type == "paragraph":
+            return "".join(render_node(child) for child in children)
+        if node_type == "text":
+            return render_inline(node)
+        if node_type == "heading":
+            level = node.get("attrs", {}).get("level", 1)
+            level = min(max(level, 1), 6)
+            return f"{'#' * level} {''.join(render_node(child) for child in children)}"
+        if node_type == "bulletList":
+            return "\n".join(f"- {render_node(child).strip()}" for child in children)
+        if node_type == "orderedList":
+            start = node.get("attrs", {}).get("start", 1)
+            lines: list[str] = []
+            for index, child in enumerate(children, start=start):
+                lines.append(f"{index}. {render_node(child).strip()}")
+            return "\n".join(lines)
+        if node_type == "listItem":
+            return " ".join(render_node(child).strip() for child in children)
+        if node_type == "blockquote":
+            return "\n".join(f"> {render_node(child).strip()}" for child in children)
+        if node_type == "codeBlock":
+            language = node.get("attrs", {}).get("language") or ""
+            code_content = "".join(render_node(child) for child in children)
+            fence = f"```{language}" if language else "```"
+            return f"{fence}\n{code_content}\n```"
+        if node_type == "horizontalRule":
+            return "---"
+        return " ".join(render_node(child) for child in children)
+
+    return render_node(content).strip()
+
+
+def _serialize_content(content: NoteContent) -> dict[str, Any]:
+    return {
+        "version": content.version,
+        "tiptap_json": content.tiptap_json,
+        "markdown": content.markdown,
+        "created_at": content.created_at,
+        "updated_at": content.updated_at,
+        "deleted_at": content.deleted_at,
+    }
 
 
 def _fetch_note(db: Session, note_id: UUID) -> Note:
@@ -199,6 +282,21 @@ def _assert_same_scope(note: Note, tag: Tag) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Tag belongs to a different user",
         )
+
+
+def _fetch_content(db: Session, note_id: UUID, version: int) -> NoteContent:
+    content = (
+        db.execute(
+            select(NoteContent).where(
+                NoteContent.note_id == note_id, NoteContent.version == version
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if not content:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Content not found")
+    return content
 
 
 @router.get("", response_model=NotesListResponse)
@@ -397,3 +495,81 @@ def move_note(note_id: UUID, *, db: Session = Depends(get_db), payload: MoveRequ
     db.commit()
     db.refresh(note)
     return NoteRead.model_validate(_serialize_note(note))
+
+
+@router.get("/{note_id}/content", response_model=NoteContentRead)
+def get_latest_content(
+    note_id: UUID,
+    *,
+    db: Session = Depends(get_db),
+    include_deleted: bool = False,
+):
+    _fetch_note(db, note_id)
+    stmt = select(NoteContent).where(NoteContent.note_id == note_id)
+    if not include_deleted:
+        stmt = stmt.where(NoteContent.deleted_at.is_(None))
+    content = db.execute(stmt.order_by(NoteContent.version.desc())).scalars().first()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No content found for note"
+        )
+    return NoteContentRead.model_validate(_serialize_content(content))
+
+
+@router.get("/{note_id}/content/history", response_model=List[NoteContentRead])
+def get_content_history(
+    note_id: UUID,
+    *,
+    db: Session = Depends(get_db),
+    include_deleted: bool = False,
+):
+    _fetch_note(db, note_id)
+    stmt = select(NoteContent).where(NoteContent.note_id == note_id)
+    if not include_deleted:
+        stmt = stmt.where(NoteContent.deleted_at.is_(None))
+    contents = db.execute(stmt.order_by(NoteContent.version.desc())).scalars().all()
+    return [NoteContentRead.model_validate(_serialize_content(content)) for content in contents]
+
+
+@router.post("/{note_id}/content", response_model=NoteContentRead, status_code=status.HTTP_201_CREATED)
+def save_content(note_id: UUID, *, db: Session = Depends(get_db), payload: NoteContentCreate):
+    _fetch_note(db, note_id)
+    max_version = db.execute(
+        select(func.coalesce(func.max(NoteContent.version), 0)).where(
+            NoteContent.note_id == note_id
+        )
+    ).scalar_one()
+    next_version = max_version + 1
+
+    markdown = payload.markdown or _convert_tiptap_to_markdown(payload.tiptap_json)
+
+    content = NoteContent(
+        note_id=note_id,
+        version=next_version,
+        tiptap_json=payload.tiptap_json,
+        markdown=markdown,
+    )
+    db.add(content)
+    db.commit()
+    db.refresh(content)
+    return NoteContentRead.model_validate(_serialize_content(content))
+
+
+@router.delete("/{note_id}/content/{version}", response_model=NoteContentRead)
+def soft_delete_content(note_id: UUID, version: int, db: Session = Depends(get_db)):
+    _fetch_note(db, note_id)
+    content = _fetch_content(db, note_id, version)
+    content.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(content)
+    return NoteContentRead.model_validate(_serialize_content(content))
+
+
+@router.post("/{note_id}/content/{version}/restore", response_model=NoteContentRead)
+def restore_content(note_id: UUID, version: int, db: Session = Depends(get_db)):
+    _fetch_note(db, note_id)
+    content = _fetch_content(db, note_id, version)
+    content.deleted_at = None
+    db.commit()
+    db.refresh(content)
+    return NoteContentRead.model_validate(_serialize_content(content))
