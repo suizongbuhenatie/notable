@@ -1,0 +1,35 @@
+:root {
+  --color-background: #f8fafc;
+  --color-surface: #ffffff;
+  --color-border: #e2e8f0;
+  --color-muted: #f1f5f9;
+  --color-primary: #2563eb;
+  --color-on-primary: #ffffff;
+  --color-text: #0f172a;
+  --color-text-muted: #475569;
+}
+
+[data-theme='dark'] {
+  --color-background: #0f172a;
+  --color-surface: #1e293b;
+  --color-border: #334155;
+  --color-muted: #111827;
+  --color-primary: #60a5fa;
+  --color-on-primary: #0b1220;
+  --color-text: #e2e8f0;
+  --color-text-muted: #cbd5e1;
+}
+
+[data-theme] {
+  color-scheme: light;
+  transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+.card-surface {
+  background: var(--color-surface);
+  box-shadow: var(--shadow-card, 0 10px 40px rgba(0, 0, 0, 0.08));
+}
